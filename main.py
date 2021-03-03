@@ -15,15 +15,16 @@
 # [START gae_flex_storage_app]
 import logging
 import os
+import synthetic
 
-from flask import Flask, request
+from flask import Flask, request, render_template
 from google.cloud import storage
 
 app = Flask(__name__)
 
 # Configure this environment variable via app.yaml
 #CLOUD_STORAGE_BUCKET = os.environ['roboticsaiapp_upload']
-CLOUD_STORAGE_BUCKET = 'roboticsaiapp_upload'
+CLOUD_STORAGE_BUCKET = 'roboticsaiapp_upload2'
 
 
 @app.route('/')
@@ -44,13 +45,15 @@ def upload():
     if not uploaded_file:
         return 'No file uploaded.', 400
 
+    if __name__ == '__main__':
     # Create a Cloud Storage client.
-    #gcs = storage.Client()
+        gcs = storage.Client.from_service_account_json('roboticsaiapp2Key.json')
+
 
     # Or Explicitly use service account credentials by specifying the private key
     # file.
-    gcs = storage.Client.from_service_account_json(
-        'RoboticsAIAppKey.json')
+    else:
+        gcs = storage.Client()
 
     # Get the bucket that the file will be uploaded to.
     bucket = gcs.get_bucket(CLOUD_STORAGE_BUCKET)
@@ -64,7 +67,16 @@ def upload():
     )
 
     # The public URL can be used to directly access the uploaded file via HTTP.
-    return blob.public_url
+    #want to return new page which displays the url, and a button to run Synthetic images.py
+    return render_template ('Synthetic.html', file = blob.public_url)
+
+@app.route('/synthetic', methods = ['POST'])
+def synth():
+    uploaded_file = request.form["uploaded_file"]
+    #need to access files in GCP buckets, and save new ones to bucket
+    result = synthetic.show_image(uploaded_file)
+    return result
+
 
 
 @app.errorhandler(500)
