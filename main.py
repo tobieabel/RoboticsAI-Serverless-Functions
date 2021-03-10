@@ -1,95 +1,87 @@
-# Copyright 2015 Google Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# [START gae_flex_storage_app]
 import logging
+from operator import itemgetter
 import os
-import synthetic
 
-from flask import Flask, request, render_template
-from google.cloud import storage
+from flask import jsonify
+from google.cloud import aiplatform
+from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Value
+import requests
+import tensorflow as tf
 
-app = Flask(__name__)
+IMG_WIDTH = 128
+COLUMNS = ['dandelion', 'daisy', 'tulips', 'sunflowers', 'roses']
 
-# Configure this environment variable via app.yaml
-#CLOUD_STORAGE_BUCKET = os.environ['roboticsaiapp_upload']
-CLOUD_STORAGE_BUCKET = 'roboticsaiapp_upload2'
-
-
-@app.route('/')
-def index():
-    return """
-<form method="POST" action="/upload" enctype="multipart/form-data">
-    <input type="file" name="file">
-    <input type="submit">
-</form>
-"""
+aip_client = aiplatform.gapic.PredictionServiceClient(client_options={
+    'api_endpoint': 'us-central1-prediction-aiplatform.googleapis.com'
+})
+aip_endpoint_name = f'projects/{os.environ["GCP_PROJECT"]}/locations/us-central1/endpoints/{os.environ["ENDPOINT_ID"]}'
 
 
-@app.route('/upload', methods=['POST'])
-def upload():
-    """Process the uploaded file and upload it to Google Cloud Storage."""
-    uploaded_file = request.files.get('file')
-
-    if not uploaded_file:
-        return 'No file uploaded.', 400
-
-    if __name__ == '__main__':
-    # Create a Cloud Storage client.
-        gcs = storage.Client.from_service_account_json('roboticsaiapp2Key.json')
-
-
-    # Or Explicitly use service account credentials by specifying the private key
-    # file.
-    else:
-        gcs = storage.Client()
-
-    # Get the bucket that the file will be uploaded to.
-    bucket = gcs.get_bucket(CLOUD_STORAGE_BUCKET)
-
-    # Create a new blob and upload the file's content.
-    blob = bucket.blob(uploaded_file.filename)
-
-    blob.upload_from_string(
-        uploaded_file.read(),
-        content_type=uploaded_file.content_type
-    )
-
-    # The public URL can be used to directly access the uploaded file via HTTP.
-    #want to return new page which displays the url, and a button to run Synthetic images.py
-    return render_template ('Synthetic.html', file = blob.public_url)
-
-@app.route('/synthetic', methods = ['POST'])
-def synth():
-    uploaded_file = request.form["uploaded_file"]
-    #need to access files in GCP buckets, and save new ones to bucket
-    result = synthetic.show_image(uploaded_file)
-    return result
+def get_prediction(instance):
+    logging.info('Sending prediction request to AI Platform ...')
+    try:
+        pb_instance = json_format.ParseDict(instance, Value())
+        response = aip_client.predict(endpoint=aip_endpoint_name,
+                                      instances=[pb_instance])
+        return list(response.predictions[0])
+    except Exception as err:
+        logging.error(f'Prediction request failed: {type(err)}: {err}')
+        return None
 
 
+def preprocess_image(image_url):
+    logging.info(f'Fetching image from URL: {image_url}')
+    try:
+        image_response = requests.get(image_url)
+        image_response.raise_for_status()
+        assert image_response.headers.get('Content-Type') == 'image/jpeg'
+    except (ConnectionError, requests.exceptions.RequestException,
+            AssertionError):
+        logging.error(f'Error fetching image from URL: {image_url}')
+        return None
 
-@app.errorhandler(500)
-def server_error(e):
-    logging.exception('An error occurred during a request.')
-    return """
-    An internal error occurred: <pre>{}</pre>
-    See logs for full stacktrace.
-    """.format(e), 500
+    logging.info('Decoding and preprocessing image ...')
+    image = tf.io.decode_jpeg(image_response.content, channels=3)
+    image = tf.image.resize_with_pad(image, IMG_WIDTH, IMG_WIDTH)
+    image = image / 255.
+    return image.numpy().tolist()  # Make it JSON-serializable
 
 
-if __name__ == '__main__':
-    # This is used when running locally. Gunicorn is used to run the
-    # application on Google App Engine. See entrypoint in app.yaml.
-    app.run(host='127.0.0.1', port=8080, debug=True)
-# [END gae_flex_storage_app]
+def classify_flower(request):
+    # Set CORS headers for the preflight request
+    if request.method == 'OPTIONS':
+        # Allows POST requests from any origin with the Content-Type
+        # header and caches preflight response for an 3600s
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+
+    # Disallow non-POSTs
+    if request.method != 'POST':
+        return ('Not found', 404)
+
+    # Set CORS headers for the main request
+    headers = {'Access-Control-Allow-Origin': '*'}
+
+    request_json = request.get_json(silent=True)
+    if not request_json or not 'image_url' in request_json:
+        return ('Invalid request', 400, headers)
+
+    instance = preprocess_image(request_json['image_url'])
+    if not instance:
+        return ('Invalid request', 400, headers)
+
+    raw_prediction = get_prediction(instance)
+    if not raw_prediction:
+        return ('Error getting prediction', 500, headers)
+
+    probabilities = zip(COLUMNS, raw_prediction)
+    sorted_probabilities = sorted(probabilities,
+                                  key=itemgetter(1),
+                                  reverse=True)
+    return (jsonify(sorted_probabilities), 200, headers)
